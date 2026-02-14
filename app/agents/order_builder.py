@@ -6,6 +6,7 @@ previous agent outputs. Pure Python logic, no LLM calls.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 
 from app.models.extraction import CatalogOutput, ConversationOutput, VisionOutput
@@ -54,6 +55,19 @@ def run_order_builder(
     total_amount = sum(item.subtotal for item in items)
     balance_due = total_amount  # Nothing paid yet
 
+    # ── Use remission total as reference if catalog total is 0 ──
+    remission = vision.remissions[0] if vision.remissions else None
+    if remission and remission.total_amount and total_amount == 0:
+        total_amount = remission.total_amount
+        balance_due = total_amount
+        warnings.append(
+            f"Total tomado de remisión (${remission.total_amount:,.0f}) — "
+            "verificar contra items reales"
+        )
+
+    # ── Clinical history (use first found) ────────────────────
+    clinical_history = vision.clinical_histories[0] if vision.clinical_histories else None
+
     # ── Build prescription (use first found) ──────────────────
     prescription: PrescriptionInsert | None = None
     if vision.prescriptions_found:
@@ -64,7 +78,7 @@ def run_order_builder(
             original_image_url=best_rx.image_url,
             ai_extraction_metadata=AiExtractionMetadata(
                 confidence=best_rx.confidence,
-                model=f"gemini-2.0-flash",
+                model="gemini-2.0-flash",
                 warnings=best_rx.warnings,
                 extracted_at=datetime.now(timezone.utc).isoformat(),
             ),
@@ -102,6 +116,11 @@ def run_order_builder(
     if any_manual:
         warnings.append("Uno o más items requieren selección manual por logística")
 
+    if remission and remission.observations:
+        obs = remission.observations.upper()
+        if "URGENTE" in obs:
+            warnings.insert(0, f"🔴 URGENTE — observación de remisión: {remission.observations}")
+
     # ── Determine completeness ────────────────────────────────
     has_items = len(items) > 0
     has_prices = total_amount > 0
@@ -121,7 +140,6 @@ def run_order_builder(
     needs_manual_review = completeness != "completo"
 
     # ── Processing time ───────────────────────────────────────
-    import time
     processing_time_ms = 0
     if processing_start:
         processing_time_ms = int((time.time() - processing_start) * 1000)
@@ -141,6 +159,9 @@ def run_order_builder(
         ),
         items=items,
         prescription=prescription,
+        remission=remission,
+        clinical_history=clinical_history,
+        image_classifications=vision.image_classifications,
         customer_updates=conversation.customer_updates,
         completeness=completeness,
         warnings=warnings,
@@ -150,8 +171,14 @@ def run_order_builder(
     )
 
     logger.info(
-        "Order built: %d items, total=$%.0f, completeness=%s, warnings=%d",
-        len(items), total_amount, completeness, len(warnings),
+        "Order built: %d items, total=$%.0f, completeness=%s, "
+        "remission=%s, clinical=%s, classifications=%d, warnings=%d",
+        len(items), total_amount, completeness,
+        "yes" if remission else "no",
+        "yes" if clinical_history else "no",
+        len(vision.image_classifications),
+        len(warnings),
     )
 
     return result
+

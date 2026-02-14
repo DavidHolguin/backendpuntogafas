@@ -10,7 +10,13 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from .extraction import CustomerUpdates
-from .prescription import AiExtractionMetadata, RxData
+from .prescription import (
+    AiExtractionMetadata,
+    ClinicalHistoryData,
+    ImageClassification,
+    RemissionData,
+    RxData,
+)
 
 
 # ── Order header for INSERT into orders ───────────────────────
@@ -56,6 +62,9 @@ class FinalOrderResult(BaseModel):
     order_draft: OrderDraftHeader = Field(default_factory=OrderDraftHeader)
     items: list[OrderDraftItem] = Field(default_factory=list)
     prescription: Optional[PrescriptionInsert] = None
+    remission: Optional[RemissionData] = None
+    clinical_history: Optional[ClinicalHistoryData] = None
+    image_classifications: list[ImageClassification] = Field(default_factory=list)
     customer_updates: Optional[CustomerUpdates] = None
     completeness: str = "minimo"          # "completo", "parcial", "minimo"
     warnings: list[str] = Field(default_factory=list)

@@ -9,7 +9,13 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
-from .prescription import NonPrescriptionImage, PrescriptionFound
+from .prescription import (
+    ClinicalHistoryData,
+    ImageClassification,
+    NonPrescriptionImage,
+    PrescriptionFound,
+    RemissionData,
+)
 
 
 # ── Agent 1: Vision Extractor output ──────────────────────────
@@ -17,6 +23,9 @@ from .prescription import NonPrescriptionImage, PrescriptionFound
 class VisionOutput(BaseModel):
     prescriptions_found: list[PrescriptionFound] = Field(default_factory=list)
     non_prescription_images: list[NonPrescriptionImage] = Field(default_factory=list)
+    remissions: list[RemissionData] = Field(default_factory=list)
+    clinical_histories: list[ClinicalHistoryData] = Field(default_factory=list)
+    image_classifications: list[ImageClassification] = Field(default_factory=list)
     error: Optional[str] = None
 
 

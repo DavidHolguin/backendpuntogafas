@@ -1,14 +1,14 @@
 """
-Agent 1: Vision Extractor — OCR for optometric prescriptions.
-Downloads images from media_urls, sends each to Gemini 2.0 Flash (multimodal),
-and extracts rx_data from prescription images.
-Non-prescription images (frames, selfies) are classified separately.
+Agent 1: Vision Extractor v2 — Classifies images into 4 types
+and extracts structured data per type:
+  1. FORMULA ÓPTICA → rx_data (OD/OS/PD)
+  2. REMISIÓN → lens_description, warranty, delivery, payment
+  3. HISTORIAL CLÍNICO → diagnosis, visual acuity
+  4. MONTURA → frame reference code
 """
 
 from __future__ import annotations
 
-import base64
-import io
 import json
 import logging
 import time
@@ -21,49 +21,107 @@ from google.genai import types as genai_types
 from app.config import settings
 from app.models.extraction import VisionOutput
 from app.models.prescription import (
+    ClinicalHistoryData,
     EyeRx,
+    ImageClassification,
     NonPrescriptionImage,
     PrescriptionFound,
     PupilDistance,
+    RemissionData,
     RxData,
+    VisualAcuity,
+    WarrantyInfo,
 )
 
 logger = logging.getLogger(__name__)
 
-# ── Gemini prompt for prescription extraction ─────────────────
+# ── Gemini V2 prompt ──────────────────────────────────────────
 
-PRESCRIPTION_PROMPT = """Eres un experto en optometría analizando una imagen.
+VISION_V2_PROMPT = """Eres un extractor de datos ópticos especializado para Punto Gafas Colombia.
+Recibes imágenes de una conversación de WhatsApp entre un asesor y un cliente.
 
-TAREA: Determinar si la imagen contiene una fórmula óptica (prescripción optométrica / receta de lentes).
+Las imágenes pueden ser de 4 tipos:
+1. FORMULA OPTICA: Certificado de fórmula de lentes formulados con valores OD/OS
+2. REMISION: Documento de remisión de Punto Gafas con descripción de lente, garantía, tiempo de entrega
+3. MONTURA: Foto de la montura/armazón seleccionada por el cliente
+4. HISTORIAL CLINICO: Parte inferior de la fórmula con diagnóstico y agudeza visual
 
-SI ES UNA FÓRMULA ÓPTICA, extrae los siguientes datos en formato JSON:
+PASO 1 - CLASIFICAR la imagen en uno de los 4 tipos.
+
+PASO 2 - EXTRAER datos según el tipo y responder SOLO con JSON:
+
+Para FORMULA OPTICA:
 {
-  "is_prescription": true,
+  "image_type": "formula",
+  "confidence": <0.0-1.0>,
   "rx_data": {
     "od": {"sphere": <número o null>, "cylinder": <número o null>, "axis": <entero o null>, "add": <número o null>},
     "os": {"sphere": <número o null>, "cylinder": <número o null>, "axis": <entero o null>, "add": <número o null>},
     "pd": {"right": <número o null>, "left": <número o null>}
   },
-  "confidence": <0.0 a 1.0>,
-  "warnings": ["lista de advertencias si algo es ilegible o dudoso"],
-  "notes": "observaciones adicionales como diagnóstico o recomendaciones"
+  "patient_name": <string o null>,
+  "document_id": <string o null>,
+  "warnings": ["lista de advertencias"],
+  "notes": "observaciones",
+  "clinical_history": null o {
+    "diagnosis_od": <string o null>,
+    "diagnosis_os": <string o null>,
+    "av_vp_od": <string o null>,
+    "av_vp_os": <string o null>,
+    "av_vl_od": <string o null>,
+    "av_vl_os": <string o null>,
+    "next_control": <string o null>,
+    "professional_name": <string o null>,
+    "confidence": <0.0-1.0>
+  }
 }
 
-SI NO ES UNA FÓRMULA (foto de montura, selfie, documento, etc):
+Para REMISION:
 {
-  "is_prescription": false,
-  "description": "descripción breve de lo que muestra la imagen"
+  "image_type": "remission",
+  "confidence": <0.0-1.0>,
+  "lens_description": <string exacta del lente ej: "Blue Block Poli">,
+  "warranty_frame": <string ej: "1 año">,
+  "warranty_lens": <string ej: "6 meses Blue">,
+  "warranty_conditions": [<lista de condiciones ej: "no golpes">],
+  "delivery_days": <número entero o null>,
+  "payment_info": <string o null>,
+  "observations": <string o null>,
+  "total_amount": <número o null>,
+  "remission_number": <string o null>
+}
+
+Para HISTORIAL CLINICO:
+{
+  "image_type": "clinical_history",
+  "confidence": <0.0-1.0>,
+  "diagnosis_od": <string o null>,
+  "diagnosis_os": <string o null>,
+  "av_vp_od": <string o null>,
+  "av_vp_os": <string o null>,
+  "av_vl_od": <string o null>,
+  "av_vl_os": <string o null>,
+  "next_control": <string o null>,
+  "professional_name": <string o null>
+}
+
+Para MONTURA:
+{
+  "image_type": "frame",
+  "confidence": <0.0-1.0>,
+  "description": "descripción breve de la montura",
+  "reference_code": <string o null si es visible>
 }
 
 REGLAS:
+- Si no puedes leer un valor, usar null, NUNCA inventar datos
 - Los valores de sphere y cylinder pueden ser positivos o negativos (ej: -2.00, +1.50)
 - El axis es un entero entre 0 y 180
-- El add (adición) es siempre positivo (ej: 1.50, 2.00)
-- PD (distancia pupilar) puede ser un solo valor total o separado derecho/izquierdo
-- Si un dato es ilegible, pon null y agrega un warning
-- Si la confianza es baja (< 0.5), indica en warnings qué valores son dudosos
-- OD = Ojo Derecho (Right Eye), OS = Ojo Izquierdo (Left Eye)
-- Busca también: DNP, DIP, DP como sinónimos de PD
+- La adición (add) es siempre positiva (ej: 1.50, 2.00)
+- PD puede ser un solo valor total o separado derecho/izquierdo
+- OD = Ojo Derecho, OS = Ojo Izquierdo
+- DNP, DIP, DP son sinónimos de PD
+- Una misma imagen puede contener fórmula + historial clínico (parte superior e inferior). Si es así, incluye clinical_history dentro de la respuesta de fórmula.
 - Responde SOLO con el JSON, sin texto adicional"""
 
 
@@ -83,7 +141,6 @@ def _call_gemini_vision(image_bytes: bytes, mime_type: str = "image/jpeg") -> di
     """Send an image to Gemini 2.0 Flash and get structured extraction."""
     client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
-    # Exponential backoff for rate limits
     for attempt in range(3):
         try:
             response = client.models.generate_content(
@@ -95,18 +152,17 @@ def _call_gemini_vision(image_bytes: bytes, mime_type: str = "image/jpeg") -> di
                                 data=image_bytes,
                                 mime_type=mime_type,
                             ),
-                            genai_types.Part.from_text(text=PRESCRIPTION_PROMPT),
+                            genai_types.Part.from_text(text=VISION_V2_PROMPT),
                         ]
                     )
                 ],
                 config=genai_types.GenerateContentConfig(
                     temperature=0.1,
-                    max_output_tokens=2000,
+                    max_output_tokens=3000,
                 ),
             )
 
             text = response.text or ""
-            # Clean markdown code fences if present
             text = text.strip()
             if text.startswith("```"):
                 text = text.split("\n", 1)[1] if "\n" in text else text[3:]
@@ -119,7 +175,7 @@ def _call_gemini_vision(image_bytes: bytes, mime_type: str = "image/jpeg") -> di
         except json.JSONDecodeError as exc:
             logger.warning("Gemini returned invalid JSON (attempt %d): %s", attempt + 1, exc)
             if attempt == 2:
-                return {"is_prescription": False, "description": "Error: respuesta no parseable de IA"}
+                return {"image_type": "other", "description": "Error: respuesta no parseable de IA"}
 
         except Exception as exc:
             err_str = str(exc).lower()
@@ -131,14 +187,13 @@ def _call_gemini_vision(image_bytes: bytes, mime_type: str = "image/jpeg") -> di
             else:
                 logger.error("Gemini vision error (attempt %d): %s", attempt + 1, exc)
                 if attempt == 2:
-                    return {"is_prescription": False, "description": f"Error de IA: {exc}"}
+                    return {"image_type": "other", "description": f"Error de IA: {exc}"}
 
-    return {"is_prescription": False, "description": "Error: agotados reintentos de IA"}
+    return {"image_type": "other", "description": "Error: agotados reintentos de IA"}
 
 
 def _guess_mime_type(url: str) -> str:
-    """Guess MIME type from URL extension."""
-    url_lower = url.lower()
+    url_lower = url.lower().split("?")[0]  # Strip query params
     if url_lower.endswith(".png"):
         return "image/png"
     if url_lower.endswith(".webp"):
@@ -148,40 +203,92 @@ def _guess_mime_type(url: str) -> str:
     return "image/jpeg"
 
 
-def _parse_extraction(data: dict[str, Any], image_url: str) -> PrescriptionFound | NonPrescriptionImage:
-    """Convert raw Gemini output to a typed model."""
-    if data.get("is_prescription"):
-        rx_raw = data.get("rx_data", {})
-        od_raw = rx_raw.get("od", {})
-        os_raw = rx_raw.get("os", {})
-        pd_raw = rx_raw.get("pd", {})
+# ── Parsers by image type ─────────────────────────────────────
 
-        rx_data = RxData(
-            od=EyeRx(**od_raw) if od_raw else None,
-            os=EyeRx(**os_raw) if os_raw else None,
-            pd=PupilDistance(**pd_raw) if pd_raw else None,
-            notes=data.get("notes"),
+def _parse_formula(data: dict[str, Any], url: str) -> tuple[
+    PrescriptionFound, ClinicalHistoryData | None
+]:
+    """Parse a formula image response into PrescriptionFound + optional ClinicalHistory."""
+    rx_raw = data.get("rx_data", {})
+    od_raw = rx_raw.get("od", {})
+    os_raw = rx_raw.get("os", {})
+    pd_raw = rx_raw.get("pd", {})
+
+    rx_data = RxData(
+        od=EyeRx(**od_raw) if od_raw else None,
+        os=EyeRx(**os_raw) if os_raw else None,
+        pd=PupilDistance(**pd_raw) if pd_raw else None,
+        notes=data.get("notes"),
+    )
+
+    prescription = PrescriptionFound(
+        image_url=url,
+        rx_data=rx_data,
+        confidence=float(data.get("confidence", 0.5)),
+        warnings=data.get("warnings", []),
+        notes=data.get("notes"),
+    )
+
+    # Check if clinical history is embedded in the same image
+    clinical = None
+    ch_raw = data.get("clinical_history")
+    if ch_raw and isinstance(ch_raw, dict):
+        clinical = _parse_clinical_raw(ch_raw, url)
+
+    return prescription, clinical
+
+
+def _parse_remission(data: dict[str, Any], url: str) -> RemissionData:
+    """Parse a remission document response."""
+    warranty = None
+    if data.get("warranty_frame") or data.get("warranty_lens") or data.get("warranty_conditions"):
+        warranty = WarrantyInfo(
+            frame=data.get("warranty_frame"),
+            lens=data.get("warranty_lens"),
+            conditions=data.get("warranty_conditions", []),
         )
 
-        return PrescriptionFound(
-            image_url=image_url,
-            rx_data=rx_data,
-            confidence=float(data.get("confidence", 0.5)),
-            warnings=data.get("warnings", []),
-            notes=data.get("notes"),
+    return RemissionData(
+        image_url=url,
+        lens_description=data.get("lens_description"),
+        warranty=warranty,
+        delivery_days=int(data["delivery_days"]) if data.get("delivery_days") else None,
+        payment_info=data.get("payment_info"),
+        observations=data.get("observations"),
+        total_amount=float(data["total_amount"]) if data.get("total_amount") else None,
+        remission_number=data.get("remission_number"),
+        confidence=float(data.get("confidence", 0.5)),
+    )
+
+
+def _parse_clinical_raw(data: dict[str, Any], url: str) -> ClinicalHistoryData:
+    """Parse raw clinical history data (standalone or embedded in formula)."""
+    va = None
+    if any(data.get(k) for k in ("av_vp_od", "av_vp_os", "av_vl_od", "av_vl_os")):
+        va = VisualAcuity(
+            vp_od=data.get("av_vp_od"),
+            vp_os=data.get("av_vp_os"),
+            vl_od=data.get("av_vl_od"),
+            vl_os=data.get("av_vl_os"),
         )
-    else:
-        return NonPrescriptionImage(
-            image_url=image_url,
-            description=data.get("description", "Imagen no clasificada"),
-        )
+
+    return ClinicalHistoryData(
+        image_url=url,
+        diagnosis_od=data.get("diagnosis_od"),
+        diagnosis_os=data.get("diagnosis_os"),
+        visual_acuity=va,
+        next_control=data.get("next_control"),
+        professional_name=data.get("professional_name"),
+        confidence=float(data.get("confidence", 0.5)),
+    )
 
 
 # ── Public API ────────────────────────────────────────────────
 
 def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
     """
-    Process all media_urls through Gemini Vision.
+    Process all media_urls through Gemini Vision v2.
+    Classifies each image and extracts structured data per type.
     Always returns a valid VisionOutput, even on complete failure.
     """
     if not media_urls:
@@ -190,6 +297,9 @@ def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
 
     prescriptions: list[PrescriptionFound] = []
     non_prescriptions: list[NonPrescriptionImage] = []
+    remissions: list[RemissionData] = []
+    clinical_histories: list[ClinicalHistoryData] = []
+    classifications: list[ImageClassification] = []
 
     for url in media_urls:
         logger.info("Processing image: %s", url)
@@ -200,20 +310,73 @@ def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
                 image_url=url,
                 description="Error: no se pudo descargar la imagen",
             ))
+            classifications.append(ImageClassification(url=url, type="other", confidence=0.0))
             continue
 
         mime_type = _guess_mime_type(url)
         result = _call_gemini_vision(image_bytes, mime_type)
-        parsed = _parse_extraction(result, url)
+        image_type = result.get("image_type", "other")
+        confidence = float(result.get("confidence", 0.5))
 
-        if isinstance(parsed, PrescriptionFound):
-            prescriptions.append(parsed)
-            logger.info("Prescription extracted (confidence: %.2f)", parsed.confidence)
-        else:
-            non_prescriptions.append(parsed)
-            logger.info("Non-prescription image: %s", parsed.description)
+        # Always add classification
+        classifications.append(ImageClassification(
+            url=url,
+            type=image_type,
+            confidence=confidence,
+        ))
+
+        try:
+            if image_type == "formula":
+                prescription, clinical = _parse_formula(result, url)
+                prescriptions.append(prescription)
+                logger.info("Formula extracted (confidence: %.2f)", prescription.confidence)
+
+                if clinical:
+                    clinical_histories.append(clinical)
+                    logger.info("Clinical history embedded in formula")
+                    # Add a second classification for the embedded clinical data
+                    classifications.append(ImageClassification(
+                        url=url, type="clinical_history", confidence=clinical.confidence,
+                    ))
+
+            elif image_type == "remission":
+                remission = _parse_remission(result, url)
+                remissions.append(remission)
+                logger.info(
+                    "Remission extracted: %s (conf: %.2f)",
+                    remission.lens_description, remission.confidence,
+                )
+
+            elif image_type == "clinical_history":
+                clinical = _parse_clinical_raw(result, url)
+                clinical_histories.append(clinical)
+                logger.info("Clinical history extracted (confidence: %.2f)", clinical.confidence)
+
+            elif image_type == "frame":
+                non_prescriptions.append(NonPrescriptionImage(
+                    image_url=url,
+                    description=result.get("description", "Montura"),
+                ))
+                logger.info("Frame image classified")
+
+            else:
+                non_prescriptions.append(NonPrescriptionImage(
+                    image_url=url,
+                    description=result.get("description", "Imagen no clasificada"),
+                ))
+                logger.info("Other image: %s", result.get("description"))
+
+        except Exception as exc:
+            logger.error("Error parsing %s result for %s: %s", image_type, url, exc, exc_info=True)
+            non_prescriptions.append(NonPrescriptionImage(
+                image_url=url,
+                description=f"Error al parsear: {exc}",
+            ))
 
     return VisionOutput(
         prescriptions_found=prescriptions,
         non_prescription_images=non_prescriptions,
+        remissions=remissions,
+        clinical_histories=clinical_histories,
+        image_classifications=classifications,
     )
