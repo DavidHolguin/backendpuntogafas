@@ -13,7 +13,9 @@ from .extraction import CustomerUpdates
 from .prescription import (
     AiExtractionMetadata,
     ClinicalHistoryData,
+    FrameData,
     ImageClassification,
+    PaymentSuggestion,
     RemissionData,
     RxData,
 )
@@ -64,7 +66,9 @@ class FinalOrderResult(BaseModel):
     prescription: Optional[PrescriptionInsert] = None
     remission: Optional[RemissionData] = None
     clinical_history: Optional[ClinicalHistoryData] = None
+    frames: list[FrameData] = Field(default_factory=list)
     image_classifications: list[ImageClassification] = Field(default_factory=list)
+    payment_suggestion: Optional[PaymentSuggestion] = None
     customer_updates: Optional[CustomerUpdates] = None
     completeness: str = "minimo"          # "completo", "parcial", "minimo"
     warnings: list[str] = Field(default_factory=list)

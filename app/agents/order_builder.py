@@ -1,6 +1,9 @@
 """
 Agent 4: Order Builder — assembles the final order draft from all
 previous agent outputs. Pure Python logic, no LLM calls.
+
+Merges payment data from remission (vision) + conversation into
+a single PaymentSuggestion. Priority: remission > conversation.
 """
 
 from __future__ import annotations
@@ -17,9 +20,57 @@ from app.models.order_draft import (
     OrderDraftItem,
     PrescriptionInsert,
 )
-from app.models.prescription import AiExtractionMetadata
+from app.models.prescription import AiExtractionMetadata, PaymentSuggestion
 
 logger = logging.getLogger(__name__)
+
+
+def _build_payment_suggestion(
+    vision: VisionOutput,
+    conversation: ConversationOutput,
+) -> PaymentSuggestion | None:
+    """
+    Merge payment info from remission + conversation into a single suggestion.
+    Priority: remission > conversation (remission is a signed document).
+    amount_reference is INFORMATIONAL ONLY — never overwrites catalog total.
+    """
+    remission = vision.remissions[0] if vision.remissions else None
+    conv_payment = conversation.payment_mentions[0] if conversation.payment_mentions else None
+
+    # Source 1: Remission (highest priority)
+    if remission and remission.payment_method:
+        return PaymentSuggestion(
+            method=remission.payment_method,
+            type=remission.payment_type or "total",
+            amount_reference=remission.payment_amount or remission.total_amount,
+            has_proof=remission.has_proof,
+            source="remission",
+            proof_url=None,
+        )
+
+    # Source 2: Conversation mentions
+    if conv_payment and conv_payment.method:
+        return PaymentSuggestion(
+            method=conv_payment.method,
+            type=conv_payment.type or "total",
+            amount_reference=conv_payment.amount,
+            has_proof=conv_payment.has_proof,
+            source=conv_payment.source,
+            proof_url=conv_payment.proof_url,
+        )
+
+    # No payment info found — check if remission exists but without method
+    if remission and remission.payment_info:
+        return PaymentSuggestion(
+            method=None,
+            type="total",
+            amount_reference=remission.total_amount,
+            has_proof=False,
+            source="remission",
+            proof_url=None,
+        )
+
+    return None
 
 
 def run_order_builder(
@@ -51,22 +102,25 @@ def run_order_builder(
             needs_manual_selection=mi.needs_manual_selection,
         ))
 
-    # ── Calculate totals ──────────────────────────────────────
+    # ── Calculate totals (from catalog items ONLY — precio es sagrado) ──
     total_amount = sum(item.subtotal for item in items)
-    balance_due = total_amount  # Nothing paid yet
+    balance_due = total_amount
 
-    # ── Use remission total as reference if catalog total is 0 ──
+    # ── Remission data (REFERENCE ONLY) ──────────────────────
     remission = vision.remissions[0] if vision.remissions else None
-    if remission and remission.total_amount and total_amount == 0:
-        total_amount = remission.total_amount
-        balance_due = total_amount
-        warnings.append(
-            f"Total tomado de remisión (${remission.total_amount:,.0f}) — "
-            "verificar contra items reales"
-        )
+
+    # NOTE: We intentionally do NOT use remission.total_amount to set the
+    # order total. The total comes exclusively from catalog item prices.
+    # The remission amount is stored as reference for the logistic team.
 
     # ── Clinical history (use first found) ────────────────────
     clinical_history = vision.clinical_histories[0] if vision.clinical_histories else None
+
+    # ── Frames ────────────────────────────────────────────────
+    frames = vision.frames
+
+    # ── Payment suggestion (merged from all sources) ──────────
+    payment_suggestion = _build_payment_suggestion(vision, conversation)
 
     # ── Build prescription (use first found) ──────────────────
     prescription: PrescriptionInsert | None = None
@@ -121,6 +175,18 @@ def run_order_builder(
         if "URGENTE" in obs:
             warnings.insert(0, f"🔴 URGENTE — observación de remisión: {remission.observations}")
 
+    # Warn if remission total differs significantly from catalog total
+    if remission and remission.total_amount and total_amount > 0:
+        diff = abs(remission.total_amount - total_amount)
+        if diff > 1000:  # More than $1.000 COP difference
+            warnings.append(
+                f"⚠️ Remisión dice ${remission.total_amount:,.0f} pero "
+                f"catálogo calcula ${total_amount:,.0f} — verificar"
+            )
+
+    if payment_suggestion and payment_suggestion.has_proof:
+        warnings.append("📎 Comprobante de pago detectado — requiere verificación")
+
     # ── Determine completeness ────────────────────────────────
     has_items = len(items) > 0
     has_prices = total_amount > 0
@@ -161,7 +227,9 @@ def run_order_builder(
         prescription=prescription,
         remission=remission,
         clinical_history=clinical_history,
+        frames=frames,
         image_classifications=vision.image_classifications,
+        payment_suggestion=payment_suggestion,
         customer_updates=conversation.customer_updates,
         completeness=completeness,
         warnings=warnings,
@@ -172,13 +240,13 @@ def run_order_builder(
 
     logger.info(
         "Order built: %d items, total=$%.0f, completeness=%s, "
-        "remission=%s, clinical=%s, classifications=%d, warnings=%d",
+        "remission=%s, clinical=%s, frames=%d, payment=%s, warnings=%d",
         len(items), total_amount, completeness,
         "yes" if remission else "no",
         "yes" if clinical_history else "no",
-        len(vision.image_classifications),
+        len(frames),
+        payment_suggestion.method if payment_suggestion else "none",
         len(warnings),
     )
 
     return result
-

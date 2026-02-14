@@ -1,6 +1,7 @@
 """
-Agent 2: Conversation Analyzer — extracts purchase intents from chat messages
-and internal notes. Internal notes have HIGHER PRIORITY than messages.
+Agent 2: Conversation Analyzer — extracts purchase intents AND payment
+mentions from chat messages and internal notes.
+Internal notes have HIGHER PRIORITY than messages.
 """
 
 from __future__ import annotations
@@ -14,7 +15,12 @@ from google import genai
 from google.genai import types as genai_types
 
 from app.config import settings
-from app.models.extraction import ConversationOutput, CustomerUpdates, ItemRequested
+from app.models.extraction import (
+    ConversationOutput,
+    CustomerUpdates,
+    ItemRequested,
+    PaymentMention,
+)
 from app.models.job import InternalNote, MessagePayload
 
 logger = logging.getLogger(__name__)
@@ -23,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 CONVERSATION_PROMPT = """Eres un analista experto de una óptica (Punto Gafas, Colombia).
 
-Tu tarea es analizar la conversación entre un asesor y un cliente, junto con las notas internas del asesor, para extraer las intenciones de compra.
+Tu tarea es analizar la conversación entre un asesor y un cliente, junto con las notas internas del asesor, para extraer las intenciones de compra Y detectar información sobre pagos.
 
 REGLA IMPORTANTE: Las NOTAS INTERNAS del asesor tienen MAYOR PESO que los mensajes del chat.
 El asesor las escribe con información CONFIRMADA.
@@ -53,10 +59,20 @@ Extrae la información en el siguiente formato JSON:
     "city": "ciudad mencionada" | null,
     "phone": "teléfono nuevo" | null,
     "address": "dirección mencionada" | null
-  }
+  },
+  "payment_mentions": [
+    {
+      "method": "efectivo" | "transferencia" | "tarjeta" | "nequi" | "daviplata" | null,
+      "type": "total" | "parcial" | null,
+      "amount": <número o null>,
+      "has_proof": true | false,
+      "source": "conversation" | "internal_note",
+      "raw_text": "fragmento original del mensaje"
+    }
+  ]
 }
 
-REGLAS:
+REGLAS PARA ITEMS:
 - Si se mencionan lentes, siempre especifica quantity=2 (par) a menos que se indique lo contrario
 - "transitions" incluye: Transitions Signature, Transitions Gen8, fotocromáticos
 - "blue block" incluye: blue light, filtro azul, blue/verde, blue UV
@@ -66,6 +82,21 @@ REGLAS:
 - Si se menciona un descuento, inclúyelo en notes
 - customer_updates: solo incluir datos explícitos que actualicen el registro del cliente
 - Si no hay mensajes ni notas relevantes, retorna items_requested como array vacío
+
+REGLAS PARA PAGOS (payment_mentions):
+- Busca menciones de pago: "ya pagué", "hice transferencia", "le envío el comprobante", "pago con tarjeta"
+- Busca montos: "le aboné 200 mil", "pago de 360.000", "pagó $160.000"
+- Mapea método de pago:
+  - "datáfono" / "datafono" = "tarjeta"
+  - "nequi" = "nequi"
+  - "daviplata" = "daviplata"
+  - "efectivo" = "efectivo"
+  - "transferencia" / "consignación" = "transferencia"
+- Si un mensaje habla de pago Y tiene un adjunto de imagen = has_proof: true
+- Si la mención viene de una nota interna, source="internal_note"
+- Solo incluir payment_mentions si realmente se menciona un pago. NO inventar.
+- Si no hay menciones de pago, retorna payment_mentions como array vacío
+
 - Responde SOLO con el JSON, sin texto adicional"""
 
 
@@ -94,6 +125,8 @@ def _build_context(
             content = msg.content or ""
             if msg.type and msg.type != "text":
                 content += f" [Adjunto: {msg.type}]"
+            if msg.attachment_url:
+                content += f" [URL adjunto: {msg.attachment_url}]"
             parts.append(f"{role_label}{ts}: {content}")
 
     if not parts:
@@ -137,7 +170,7 @@ def _call_gemini_conversation(context: str) -> dict[str, Any]:
         except json.JSONDecodeError as exc:
             logger.warning("Gemini conversation: invalid JSON (attempt %d): %s", attempt + 1, exc)
             if attempt == 2:
-                return {"items_requested": [], "error": "Respuesta no parseable de IA"}
+                return {"items_requested": [], "payment_mentions": [], "error": "Respuesta no parseable de IA"}
 
         except Exception as exc:
             err_str = str(exc).lower()
@@ -149,9 +182,9 @@ def _call_gemini_conversation(context: str) -> dict[str, Any]:
             else:
                 logger.error("Gemini conversation error (attempt %d): %s", attempt + 1, exc)
                 if attempt == 2:
-                    return {"items_requested": [], "error": str(exc)}
+                    return {"items_requested": [], "payment_mentions": [], "error": str(exc)}
 
-    return {"items_requested": [], "error": "Agotados reintentos de IA"}
+    return {"items_requested": [], "payment_mentions": [], "error": "Agotados reintentos de IA"}
 
 
 def _parse_conversation_result(raw: dict[str, Any]) -> ConversationOutput:
@@ -182,6 +215,19 @@ def _parse_conversation_result(raw: dict[str, Any]) -> ConversationOutput:
             address=cu_raw.get("address"),
         )
 
+    # Parse payment mentions
+    payment_mentions = []
+    for pm_raw in raw.get("payment_mentions", []):
+        payment_mentions.append(PaymentMention(
+            method=pm_raw.get("method"),
+            type=pm_raw.get("type"),
+            amount=float(pm_raw["amount"]) if pm_raw.get("amount") else None,
+            has_proof=bool(pm_raw.get("has_proof", False)),
+            proof_url=pm_raw.get("proof_url"),
+            source=pm_raw.get("source", "conversation"),
+            raw_text=pm_raw.get("raw_text"),
+        ))
+
     warnings: list[str] = []
     if not items:
         warnings.append("No se identificaron productos en la conversación")
@@ -194,6 +240,7 @@ def _parse_conversation_result(raw: dict[str, Any]) -> ConversationOutput:
         urgency=raw.get("urgency", "desconocida"),
         promised_date_hint=raw.get("promised_date_hint"),
         customer_updates=customer_updates,
+        payment_mentions=payment_mentions,
         warnings=warnings,
         error=raw.get("error"),
     )
@@ -207,7 +254,7 @@ def run_conversation_analyzer(
     instructions: str | None = None,
 ) -> ConversationOutput:
     """
-    Analyze conversation + notes to extract purchase intents.
+    Analyze conversation + notes to extract purchase intents and payment mentions.
     Always returns a valid ConversationOutput, even with no data.
     """
     has_messages = any(m.content for m in messages)
@@ -226,7 +273,9 @@ def run_conversation_analyzer(
     result = _parse_conversation_result(raw)
 
     logger.info(
-        "Conversation analysis: %d items, urgency=%s",
-        len(result.items_requested), result.urgency,
+        "Conversation analysis: %d items, %d payment_mentions, urgency=%s",
+        len(result.items_requested),
+        len(result.payment_mentions),
+        result.urgency,
     )
     return result

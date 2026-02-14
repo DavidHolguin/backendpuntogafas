@@ -35,9 +35,11 @@ def run_pipeline(job: AIOrderJob) -> FinalOrderResult:
     try:
         vision = run_vision_extractor(payload.media_urls)
         logger.info(
-            "Vision: %d prescriptions, %d non-prescription images",
+            "Vision: %d prescriptions, %d remissions, %d frames, %d classifications",
             len(vision.prescriptions_found),
-            len(vision.non_prescription_images),
+            len(vision.remissions),
+            len(vision.frames),
+            len(vision.image_classifications),
         )
     except Exception as exc:
         error_msg = f"Vision extractor fallo: {exc}"
@@ -55,8 +57,9 @@ def run_pipeline(job: AIOrderJob) -> FinalOrderResult:
             instructions=payload.instructions,
         )
         logger.info(
-            "Conversation: %d items, urgency=%s",
+            "Conversation: %d items, %d payment_mentions, urgency=%s",
             len(conversation.items_requested),
+            len(conversation.payment_mentions),
             conversation.urgency,
         )
     except Exception as exc:

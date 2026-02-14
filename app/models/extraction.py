@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from .prescription import (
     ClinicalHistoryData,
+    FrameData,
     ImageClassification,
     NonPrescriptionImage,
     PrescriptionFound,
@@ -25,6 +26,7 @@ class VisionOutput(BaseModel):
     non_prescription_images: list[NonPrescriptionImage] = Field(default_factory=list)
     remissions: list[RemissionData] = Field(default_factory=list)
     clinical_histories: list[ClinicalHistoryData] = Field(default_factory=list)
+    frames: list[FrameData] = Field(default_factory=list)
     image_classifications: list[ImageClassification] = Field(default_factory=list)
     error: Optional[str] = None
 
@@ -53,12 +55,24 @@ class CustomerUpdates(BaseModel):
     address: Optional[str] = None
 
 
+class PaymentMention(BaseModel):
+    """A mention of payment found in conversation messages or internal notes."""
+    method: Optional[str] = None          # efectivo|transferencia|tarjeta|nequi|daviplata
+    type: Optional[str] = None            # "total" | "parcial"
+    amount: Optional[float] = None        # monto mencionado
+    has_proof: bool = False               # si hay adjunto que parece comprobante
+    proof_url: Optional[str] = None       # URL del adjunto/comprobante
+    source: str = "conversation"          # "conversation" | "internal_note"
+    raw_text: Optional[str] = None        # fragmento de texto original
+
+
 class ConversationOutput(BaseModel):
     items_requested: list[ItemRequested] = Field(default_factory=list)
     special_instructions: Optional[str] = None
     urgency: str = "desconocida"
     promised_date_hint: Optional[str] = None
     customer_updates: Optional[CustomerUpdates] = None
+    payment_mentions: list[PaymentMention] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     error: Optional[str] = None
 

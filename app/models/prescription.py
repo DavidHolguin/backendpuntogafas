@@ -1,5 +1,6 @@
 """
-Pydantic models for optical prescriptions (rx_data).
+Pydantic models for optical prescriptions (rx_data), remission data,
+clinical history, frame data, payment suggestions, and image classification.
 All numeric fields are Optional — partial data is expected.
 """
 
@@ -68,9 +69,13 @@ class RemissionData(BaseModel):
     lens_description: Optional[str] = None      # ej: "Blue Block Poli"
     warranty: Optional[WarrantyInfo] = None
     delivery_days: Optional[int] = None          # ej: 12
-    payment_info: Optional[str] = None           # ej: "Pago completo - Datáfono"
+    payment_info: Optional[str] = None           # ej: "Pago completo - Datáfono" (raw text)
+    payment_method: Optional[str] = None         # mapped: efectivo|transferencia|tarjeta|nequi|daviplata
+    payment_type: Optional[str] = None           # "total" | "parcial"
+    payment_amount: Optional[float] = None       # monto pagado (referencia, NO total del pedido)
+    has_proof: bool = False                       # si el cliente envió comprobante
     observations: Optional[str] = None           # ej: "URGENTE"
-    total_amount: Optional[float] = None         # ej: 160000
+    total_amount: Optional[float] = None         # monto remisión (REFERENCIA, sistema recalcula)
     remission_number: Optional[str] = None       # ej: "10241"
     confidence: float = 0.0
 
@@ -93,6 +98,31 @@ class ClinicalHistoryData(BaseModel):
     next_control: Optional[str] = None
     professional_name: Optional[str] = None
     confidence: float = 0.0
+
+
+# ── Frame data ────────────────────────────────────────────────
+
+class FrameData(BaseModel):
+    """A frame/montura image classified by the Vision agent."""
+    image_url: Optional[str] = None
+    reference_code: Optional[str] = None   # código leído de la montura si visible
+    description: Optional[str] = None
+    confidence: float = 0.0
+
+
+# ── Payment suggestion (merged from remission + conversation) ──
+
+class PaymentSuggestion(BaseModel):
+    """
+    Unified payment suggestion built from remission + conversation data.
+    amount_reference is INFORMATIONAL ONLY — never overwrites catalog total.
+    """
+    method: Optional[str] = None          # efectivo|transferencia|tarjeta|nequi|daviplata
+    type: str = "total"                   # "total" | "parcial"
+    amount_reference: Optional[float] = None  # monto referencia (NO precio real)
+    has_proof: bool = False
+    source: str = "remission"             # "remission" | "conversation" | "internal_note"
+    proof_url: Optional[str] = None       # URL del comprobante si se detectó
 
 
 # ── Image classification ──────────────────────────────────────

@@ -1,10 +1,12 @@
 """
-Agent 1: Vision Extractor v2 — Classifies images into 4 types
-and extracts structured data per type:
-  1. FORMULA ÓPTICA → rx_data (OD/OS/PD)
-  2. REMISIÓN → lens_description, warranty, delivery, payment
-  3. HISTORIAL CLÍNICO → diagnosis, visual acuity
-  4. MONTURA → frame reference code
+Agent 1: Vision Extractor v3 — Classifies images into 4 types
+and extracts structured data per type, including payment info.
+
+Types:
+  1. FORMULA ÓPTICA → rx_data (OD/OS/PD) + optional embedded clinical_history
+  2. REMISIÓN → lens, warranty, delivery, payment method/type/amount
+  3. MONTURA → frame reference code, description
+  4. HISTORIAL CLÍNICO → diagnosis, visual acuity
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from app.models.extraction import VisionOutput
 from app.models.prescription import (
     ClinicalHistoryData,
     EyeRx,
+    FrameData,
     ImageClassification,
     NonPrescriptionImage,
     PrescriptionFound,
@@ -35,22 +38,21 @@ from app.models.prescription import (
 
 logger = logging.getLogger(__name__)
 
-# ── Gemini V2 prompt ──────────────────────────────────────────
+# ── Gemini V3 prompt ──────────────────────────────────────────
 
-VISION_V2_PROMPT = """Eres un extractor de datos ópticos especializado para Punto Gafas Colombia.
+VISION_V3_PROMPT = """Eres un extractor de datos ópticos especializado para Punto Gafas Colombia.
 Recibes imágenes de una conversación de WhatsApp entre un asesor y un cliente.
 
-Las imágenes pueden ser de 4 tipos:
-1. FORMULA OPTICA: Certificado de fórmula de lentes formulados con valores OD/OS
-2. REMISION: Documento de remisión de Punto Gafas con descripción de lente, garantía, tiempo de entrega
-3. MONTURA: Foto de la montura/armazón seleccionada por el cliente
-4. HISTORIAL CLINICO: Parte inferior de la fórmula con diagnóstico y agudeza visual
+CLASIFICACIÓN DE IMÁGENES (4 tipos):
+1. FORMULA ÓPTICA: Certificado con valores refractivos OD/OS
+2. REMISIÓN: Documento de remisión de Punto Gafas
+3. MONTURA: Foto de la montura/armazón seleccionada
+4. HISTORIAL CLÍNICO: Diagnóstico y agudeza visual
 
 PASO 1 - CLASIFICAR la imagen en uno de los 4 tipos.
-
 PASO 2 - EXTRAER datos según el tipo y responder SOLO con JSON:
 
-Para FORMULA OPTICA:
+Para FORMULA ÓPTICA:
 {
   "image_type": "formula",
   "confidence": <0.0-1.0>,
@@ -76,7 +78,7 @@ Para FORMULA OPTICA:
   }
 }
 
-Para REMISION:
+Para REMISIÓN:
 {
   "image_type": "remission",
   "confidence": <0.0-1.0>,
@@ -85,13 +87,22 @@ Para REMISION:
   "warranty_lens": <string ej: "6 meses Blue">,
   "warranty_conditions": [<lista de condiciones ej: "no golpes">],
   "delivery_days": <número entero o null>,
-  "payment_info": <string o null>,
   "observations": <string o null>,
+  "remission_number": <string o null>,
   "total_amount": <número o null>,
-  "remission_number": <string o null>
+  "payment_method": <string mapeado: ver reglas abajo>,
+  "payment_type": "total" o "parcial",
+  "payment_amount": <número o null>
 }
 
-Para HISTORIAL CLINICO:
+MAPEO DE MÉTODOS DE PAGO:
+- "Datáfono" o "Datafono" = "tarjeta"
+- "Nequi" = "nequi"
+- "Daviplata" = "daviplata"
+- "Efectivo" = "efectivo"
+- "Transferencia" o "Consignación" = "transferencia"
+
+Para HISTORIAL CLÍNICO:
 {
   "image_type": "clinical_history",
   "confidence": <0.0-1.0>,
@@ -122,6 +133,9 @@ REGLAS:
 - OD = Ojo Derecho, OS = Ojo Izquierdo
 - DNP, DIP, DP son sinónimos de PD
 - Una misma imagen puede contener fórmula + historial clínico (parte superior e inferior). Si es así, incluye clinical_history dentro de la respuesta de fórmula.
+- NUNCA usar el monto de la remisión como precio final del pedido
+- El monto de pago es REFERENCIAL, el sistema calcula el total desde el catálogo de lentes
+- Reportar confidence 0.0-1.0 por imagen
 - Responde SOLO con el JSON, sin texto adicional"""
 
 
@@ -138,7 +152,7 @@ def _download_image(url: str) -> bytes | None:
 
 
 def _call_gemini_vision(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict[str, Any]:
-    """Send an image to Gemini 2.0 Flash and get structured extraction."""
+    """Send an image to Gemini and get structured extraction."""
     client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
     for attempt in range(3):
@@ -152,7 +166,7 @@ def _call_gemini_vision(image_bytes: bytes, mime_type: str = "image/jpeg") -> di
                                 data=image_bytes,
                                 mime_type=mime_type,
                             ),
-                            genai_types.Part.from_text(text=VISION_V2_PROMPT),
+                            genai_types.Part.from_text(text=VISION_V3_PROMPT),
                         ]
                     )
                 ],
@@ -193,7 +207,7 @@ def _call_gemini_vision(image_bytes: bytes, mime_type: str = "image/jpeg") -> di
 
 
 def _guess_mime_type(url: str) -> str:
-    url_lower = url.lower().split("?")[0]  # Strip query params
+    url_lower = url.lower().split("?")[0]
     if url_lower.endswith(".png"):
         return "image/png"
     if url_lower.endswith(".webp"):
@@ -239,7 +253,7 @@ def _parse_formula(data: dict[str, Any], url: str) -> tuple[
 
 
 def _parse_remission(data: dict[str, Any], url: str) -> RemissionData:
-    """Parse a remission document response."""
+    """Parse a remission document response with structured payment data."""
     warranty = None
     if data.get("warranty_frame") or data.get("warranty_lens") or data.get("warranty_conditions"):
         warranty = WarrantyInfo(
@@ -248,12 +262,24 @@ def _parse_remission(data: dict[str, Any], url: str) -> RemissionData:
             conditions=data.get("warranty_conditions", []),
         )
 
+    # Build raw payment_info text for backward compat
+    payment_parts = []
+    if data.get("payment_type"):
+        payment_parts.append("Pago " + data["payment_type"])
+    if data.get("payment_method"):
+        payment_parts.append(data["payment_method"])
+    payment_info = " - ".join(payment_parts) if payment_parts else None
+
     return RemissionData(
         image_url=url,
         lens_description=data.get("lens_description"),
         warranty=warranty,
         delivery_days=int(data["delivery_days"]) if data.get("delivery_days") else None,
-        payment_info=data.get("payment_info"),
+        payment_info=payment_info,
+        payment_method=data.get("payment_method"),
+        payment_type=data.get("payment_type"),
+        payment_amount=float(data["payment_amount"]) if data.get("payment_amount") else None,
+        has_proof=bool(data.get("has_proof", False)),
         observations=data.get("observations"),
         total_amount=float(data["total_amount"]) if data.get("total_amount") else None,
         remission_number=data.get("remission_number"),
@@ -283,11 +309,21 @@ def _parse_clinical_raw(data: dict[str, Any], url: str) -> ClinicalHistoryData:
     )
 
 
+def _parse_frame(data: dict[str, Any], url: str) -> FrameData:
+    """Parse a frame/montura image response."""
+    return FrameData(
+        image_url=url,
+        reference_code=data.get("reference_code"),
+        description=data.get("description", "Montura"),
+        confidence=float(data.get("confidence", 0.5)),
+    )
+
+
 # ── Public API ────────────────────────────────────────────────
 
 def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
     """
-    Process all media_urls through Gemini Vision v2.
+    Process all media_urls through Gemini Vision v3.
     Classifies each image and extracts structured data per type.
     Always returns a valid VisionOutput, even on complete failure.
     """
@@ -299,6 +335,7 @@ def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
     non_prescriptions: list[NonPrescriptionImage] = []
     remissions: list[RemissionData] = []
     clinical_histories: list[ClinicalHistoryData] = []
+    frames: list[FrameData] = []
     classifications: list[ImageClassification] = []
 
     for url in media_urls:
@@ -334,7 +371,6 @@ def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
                 if clinical:
                     clinical_histories.append(clinical)
                     logger.info("Clinical history embedded in formula")
-                    # Add a second classification for the embedded clinical data
                     classifications.append(ImageClassification(
                         url=url, type="clinical_history", confidence=clinical.confidence,
                     ))
@@ -343,8 +379,11 @@ def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
                 remission = _parse_remission(result, url)
                 remissions.append(remission)
                 logger.info(
-                    "Remission extracted: %s (conf: %.2f)",
-                    remission.lens_description, remission.confidence,
+                    "Remission extracted: %s, payment=%s/%s (conf: %.2f)",
+                    remission.lens_description,
+                    remission.payment_method,
+                    remission.payment_type,
+                    remission.confidence,
                 )
 
             elif image_type == "clinical_history":
@@ -353,11 +392,9 @@ def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
                 logger.info("Clinical history extracted (confidence: %.2f)", clinical.confidence)
 
             elif image_type == "frame":
-                non_prescriptions.append(NonPrescriptionImage(
-                    image_url=url,
-                    description=result.get("description", "Montura"),
-                ))
-                logger.info("Frame image classified")
+                frame = _parse_frame(result, url)
+                frames.append(frame)
+                logger.info("Frame classified: %s (ref: %s)", frame.description, frame.reference_code)
 
             else:
                 non_prescriptions.append(NonPrescriptionImage(
@@ -378,5 +415,6 @@ def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
         non_prescription_images=non_prescriptions,
         remissions=remissions,
         clinical_histories=clinical_histories,
+        frames=frames,
         image_classifications=classifications,
     )
