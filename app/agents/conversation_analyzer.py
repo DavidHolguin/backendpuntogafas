@@ -113,8 +113,8 @@ def _call_gemini_conversation(context: str) -> dict[str, Any]:
                 contents=[
                     genai_types.Content(
                         parts=[
-                            genai_types.Part.from_text(CONVERSATION_PROMPT),
-                            genai_types.Part.from_text(f"\n\n--- DATOS A ANALIZAR ---\n\n{context}"),
+                            genai_types.Part.from_text(text=CONVERSATION_PROMPT),
+                            genai_types.Part.from_text(text=f"\n\n--- DATOS A ANALIZAR ---\n\n{context}"),
                         ]
                     )
                 ],

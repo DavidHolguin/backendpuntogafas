@@ -95,7 +95,7 @@ def _call_gemini_vision(image_bytes: bytes, mime_type: str = "image/jpeg") -> di
                                 data=image_bytes,
                                 mime_type=mime_type,
                             ),
-                            genai_types.Part.from_text(PRESCRIPTION_PROMPT),
+                            genai_types.Part.from_text(text=PRESCRIPTION_PROMPT),
                         ]
                     )
                 ],
