@@ -43,6 +43,13 @@ class SupabaseClient:
     def table(self, name: str) -> "TableQuery":
         return TableQuery(self, name)
 
+    def call_function(self, name: str, body: dict[str, Any]) -> httpx.Response:
+        """Invoke a Supabase Edge Function by name."""
+        url = f"{self.base_url}/functions/v1/{name}"
+        resp = self._client.post(url, json=body)
+        resp.raise_for_status()
+        return resp
+
     def close(self) -> None:
         self._client.close()
 

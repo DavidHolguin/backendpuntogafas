@@ -18,6 +18,7 @@ import json
 import logging
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -50,18 +51,6 @@ def setup_logging() -> None:
     handler.setFormatter(JSONFormatter())
     logging.root.handlers = [handler]
     logging.root.setLevel(logging.INFO)
-
-
-# ── Signal handling ───────────────────────────────────────────
-
-_shutdown_requested = False
-
-
-def _signal_handler(signum: int, frame: object) -> None:
-    global _shutdown_requested
-    logger = logging.getLogger(__name__)
-    logger.info("Shutdown signal received (%s), finishing current job...", signum)
-    _shutdown_requested = True
 
 
 # ── Job lifecycle ─────────────────────────────────────────────
@@ -146,21 +135,25 @@ def process_job(job: AIOrderJob) -> None:
 
 # ── Main loop ─────────────────────────────────────────────────
 
-def main() -> None:
-    """Entry point for the worker daemon."""
+
+# ── Main loop ─────────────────────────────────────────────────
+
+def run_worker_loop(stop_event: threading.Event | None = None) -> None:
+    """
+    Run the worker polling loop. 
+    Can be stopped by setting the stop_event.
+    """
+    if stop_event is None:
+        stop_event = threading.Event()
+
     setup_logging()
     logger = logging.getLogger(__name__)
 
-    # Register signal handlers
-    signal.signal(signal.SIGTERM, _signal_handler)
-    signal.signal(signal.SIGINT, _signal_handler)
-
     logger.info("=" * 60)
-    logger.info("AI Order Worker starting")
+    logger.info("AI Order Worker loop starting")
     logger.info("Supabase URL: %s", settings.SUPABASE_URL)
     logger.info("Gemini model: %s", settings.GEMINI_MODEL)
     logger.info("Poll interval: %ds", settings.POLL_INTERVAL_SECONDS)
-    logger.info("Job timeout: %ds", settings.JOB_TIMEOUT_SECONDS)
     logger.info("=" * 60)
 
     # Verify Supabase connectivity
@@ -170,26 +163,50 @@ def main() -> None:
         logger.info("Supabase connection verified ✓")
     except Exception as exc:
         logger.error("Cannot connect to Supabase: %s", exc)
-        sys.exit(1)
+        # In a threaded context, we might not want to exit the whole process, 
+        # but for the worker it's critical.
+        if stop_event is None: # Standalone
+            sys.exit(1)
+        return
 
     # Main polling loop
-    while not _shutdown_requested:
+    while not stop_event.is_set():
         try:
             job = claim_job()
 
             if job:
                 process_job(job)
             else:
-                time.sleep(settings.POLL_INTERVAL_SECONDS)
+                # Sleep in small chunks to allow quick shutdown
+                for _ in range(settings.POLL_INTERVAL_SECONDS * 10):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(0.1)
 
         except KeyboardInterrupt:
-            logger.info("KeyboardInterrupt received, shutting down...")
+            # Should only happen in standalone mode
+            logger.info("KeyboardInterrupt received")
             break
         except Exception as exc:
             logger.error("Unexpected error in main loop: %s", exc, exc_info=True)
             time.sleep(settings.POLL_INTERVAL_SECONDS)
 
-    logger.info("Worker shutdown complete")
+    logger.info("Worker loop shutdown complete")
+
+
+def main() -> None:
+    """Entry point for the standalone worker daemon."""
+    stop_event = threading.Event()
+
+    def _signal_handler(signum: int, frame: object) -> None:
+        logging.getLogger(__name__).info("Shutdown signal received (%s)...", signum)
+        stop_event.set()
+
+    # Register signal handlers
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    run_worker_loop(stop_event)
 
 
 if __name__ == "__main__":

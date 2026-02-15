@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     JOB_TIMEOUT_SECONDS: int = 180
     MAX_RETRIES: int = 2
 
+    # ── Server ────────────────────────────────────────────────
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+
+    # ── CrewAI ────────────────────────────────────────────────
+    CREWAI_VERBOSE: bool = True
+
     # ── Retry backoff for Gemini rate-limits ───────────────────
     RETRY_BASE_DELAY: float = 1.0       # seconds
     RETRY_MAX_DELAY: float = 4.0        # seconds
