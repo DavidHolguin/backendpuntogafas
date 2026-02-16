@@ -11,6 +11,7 @@ import time
 
 from google import genai
 from google.genai import types
+import httpx
 
 from app.config import settings
 from app.models.shipping import ExtractedGuideData
@@ -41,6 +42,18 @@ REGLAS:
 - Responde SOLO con el JSON, sin texto adicional"""
 
 
+def _download_image(url: str) -> bytes | None:
+    """Download an image from a URL. Returns bytes or None on failure."""
+    try:
+        with httpx.Client(timeout=30, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            return resp.content
+    except Exception as exc:
+        logger.error("Failed to download image %s: %s", url, exc)
+        return None
+
+
 def extract_guide_data(
     image_url: str,
     carrier_context: str = "",
@@ -61,6 +74,13 @@ def extract_guide_data(
 
     user_prompt = f"Analiza esta imagen de guía de transporte colombiana.{carrier_context}\n\nExtrae los datos en el formato JSON especificado."
 
+    
+    # Download image first
+    image_bytes = _download_image(image_url)
+    if not image_bytes:
+        logger.error("Could not download image: %s", image_url)
+        return ExtractedGuideData()
+
     try:
         response = client.models.generate_content(
             model=settings.GEMINI_MODEL,
@@ -68,8 +88,8 @@ def extract_guide_data(
                 types.Content(
                     role="user",
                     parts=[
-                        types.Part.from_uri(
-                            file_uri=image_url,
+                        types.Part.from_bytes(
+                            data=image_bytes,
                             mime_type="image/jpeg",
                         ),
                         types.Part.from_text(text=user_prompt),
