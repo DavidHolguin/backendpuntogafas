@@ -28,6 +28,7 @@ class OrderDraftHeader(BaseModel):
     sede_id: Optional[str] = None
     seller_id: Optional[str] = None
     status: str = "borrador"
+    order_type: str = "optico"             # "optico" | "venta_directa"
     total_amount: float = 0
     balance_due: float = 0
     payment_status: str = "pendiente"
@@ -62,6 +63,7 @@ class PrescriptionInsert(BaseModel):
 
 class FinalOrderResult(BaseModel):
     order_draft: OrderDraftHeader = Field(default_factory=OrderDraftHeader)
+    order_type: str = "optico"            # "optico" | "venta_directa"
     items: list[OrderDraftItem] = Field(default_factory=list)
     prescription: Optional[PrescriptionInsert] = None
     remission: Optional[RemissionData] = None
@@ -71,6 +73,7 @@ class FinalOrderResult(BaseModel):
     payment_suggestion: Optional[PaymentSuggestion] = None
     customer_updates: Optional[CustomerUpdates] = None
     completeness: str = "minimo"          # "completo", "parcial", "minimo"
+    suggested_status: Optional[str] = None  # "entregado" for venta_directa
     warnings: list[str] = Field(default_factory=list)
     needs_manual_review: bool = True
     processing_time_ms: int = 0

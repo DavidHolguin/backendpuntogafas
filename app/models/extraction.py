@@ -73,6 +73,7 @@ class ConversationOutput(BaseModel):
     promised_date_hint: Optional[str] = None
     customer_updates: Optional[CustomerUpdates] = None
     payment_mentions: list[PaymentMention] = Field(default_factory=list)
+    suggested_order_type: Optional[str] = None  # "optico" | "venta_directa"
     warnings: list[str] = Field(default_factory=list)
     error: Optional[str] = None
 

@@ -2,6 +2,10 @@
 Agent 2: Conversation Analyzer — extracts purchase intents AND payment
 mentions from chat messages and internal notes.
 Internal notes have HIGHER PRIORITY than messages.
+
+Sale-tag aware:
+  - Includes sale_tag annotations in the LLM context
+  - Detects venta_directa intent when all notes are tagged
 """
 
 from __future__ import annotations
@@ -33,6 +37,13 @@ Tu tarea es analizar la conversación entre un asesor y un cliente, junto con la
 
 REGLA IMPORTANTE: Las NOTAS INTERNAS del asesor tienen MAYOR PESO que los mensajes del chat.
 El asesor las escribe con información CONFIRMADA.
+
+ETIQUETAS DE VENTA (sale_tag):
+- Si una nota tiene etiqueta [🏷️ montura], el asesor confirmó que es una venta de montura/armazón.
+- Si una nota tiene etiqueta [🏷️ estuche], el asesor confirmó que es una venta de estuche.
+- Cuando TODAS las notas tienen etiquetas de venta (montura y/o estuche) y NO hay fórmula óptica, 
+  se trata de una VENTA DIRECTA de accesorios, no de un pedido óptico con lentes.
+- En venta directa, los items deben ser tipo "montura" o "accesorio" según la etiqueta.
 
 Extrae la información en el siguiente formato JSON:
 {
@@ -82,6 +93,7 @@ REGLAS PARA ITEMS:
 - Si se menciona un descuento, inclúyelo en notes
 - customer_updates: solo incluir datos explícitos que actualicen el registro del cliente
 - Si no hay mensajes ni notas relevantes, retorna items_requested como array vacío
+- Para ventas directas (etiquetas montura/estuche): usa type="montura" para monturas y type="accesorio" para estuches, NO uses type="lente"
 
 REGLAS PARA PAGOS (payment_mentions):
 - Busca menciones de pago: "ya pagué", "hice transferencia", "le envío el comprobante", "pago con tarjeta"
@@ -112,7 +124,11 @@ def _build_context(
         parts.append("=== NOTAS INTERNAS DEL ASESOR (MAYOR PRIORIDAD) ===")
         for note in internal_notes:
             ts = f" [{note.created_at}]" if note.created_at else ""
-            parts.append(f"📝{ts} {note.content or '(vacía)'}")
+            tag = f" [🏷️ {note.sale_tag}]" if note.sale_tag else ""
+            content = note.content or "(vacía)"
+            if note.attachment_url:
+                content += f" [Adjunto: {note.type or 'image'}]"
+            parts.append(f"📝{ts}{tag} {content}")
 
     if instructions:
         parts.append(f"\n=== INSTRUCCIONES ESPECIALES ===\n{instructions}")
@@ -133,6 +149,43 @@ def _build_context(
         return "(Sin mensajes ni notas internas disponibles)"
 
     return "\n".join(parts)
+
+
+def _detect_venta_directa(
+    internal_notes: list[InternalNote],
+    items: list[ItemRequested],
+) -> str | None:
+    """
+    Detect if this is a venta_directa based on sale_tags and item types.
+
+    Returns 'venta_directa' if:
+      - There are internal notes with sale_tag set
+      - All notes with content have sale_tag (montura or estuche)
+      - No lens items were detected
+    Otherwise returns 'optico' or None.
+    """
+    # Get notes that have actual content (not empty system notes)
+    content_notes = [n for n in internal_notes if n.content]
+    tagged_notes = [n for n in content_notes if n.sale_tag]
+
+    if not tagged_notes:
+        return None  # No tags → standard flow, let downstream decide
+
+    # Check if ALL content notes are tagged
+    all_tagged = len(tagged_notes) == len(content_notes) if content_notes else False
+
+    # Check if any lens items were detected
+    has_lens = any(item.type == "lente" for item in items)
+
+    if all_tagged and not has_lens:
+        return "venta_directa"
+
+    # Even if some notes are tagged, if there's a lens request → optico
+    if has_lens:
+        return "optico"
+
+    # Mixed scenario: some tagged, some not → optico (safer)
+    return "optico"
 
 
 def _call_gemini_conversation(context: str) -> dict[str, Any]:
@@ -255,6 +308,7 @@ def run_conversation_analyzer(
 ) -> ConversationOutput:
     """
     Analyze conversation + notes to extract purchase intents and payment mentions.
+    Detects venta_directa intent from sale_tags on internal notes.
     Always returns a valid ConversationOutput, even with no data.
     """
     has_messages = any(m.content for m in messages)
@@ -272,10 +326,17 @@ def run_conversation_analyzer(
     raw = _call_gemini_conversation(context)
     result = _parse_conversation_result(raw)
 
+    # ── Detect venta_directa from sale_tags ────────────────────
+    suggested_order_type = _detect_venta_directa(internal_notes, result.items_requested)
+    if suggested_order_type:
+        result.suggested_order_type = suggested_order_type
+        logger.info("Detected order type: %s", suggested_order_type)
+
     logger.info(
-        "Conversation analysis: %d items, %d payment_mentions, urgency=%s",
+        "Conversation analysis: %d items, %d payment_mentions, urgency=%s, order_type=%s",
         len(result.items_requested),
         len(result.payment_mentions),
         result.urgency,
+        result.suggested_order_type,
     )
     return result

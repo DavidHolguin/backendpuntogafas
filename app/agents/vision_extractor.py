@@ -7,6 +7,11 @@ Types:
   2. REMISIÓN → lens, warranty, delivery, payment method/type/amount
   3. MONTURA → frame reference code, description
   4. HISTORIAL CLÍNICO → diagnosis, visual acuity
+
+Sale-tag aware:
+  - sale_tag='montura' → classify as frame directly (skip Gemini)
+  - sale_tag='estuche' → classify as estuche reference (skip Gemini)
+  - sale_tag=None → standard Gemini classification
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from google.genai import types as genai_types
 
 from app.config import settings
 from app.models.extraction import VisionOutput
+from app.models.job import InternalNote
 from app.models.prescription import (
     ClinicalHistoryData,
     EyeRx,
@@ -319,17 +325,44 @@ def _parse_frame(data: dict[str, Any], url: str) -> FrameData:
     )
 
 
+# ── Sale-tag helpers ──────────────────────────────────────────
+
+def _build_sale_tag_map(internal_notes: list[InternalNote]) -> dict[str, str]:
+    """
+    Build a mapping from attachment_url -> sale_tag for notes that have both.
+    This allows the vision extractor to know if an image URL was tagged.
+    """
+    tag_map: dict[str, str] = {}
+    for note in internal_notes:
+        if note.sale_tag and note.attachment_url:
+            tag_map[note.attachment_url] = note.sale_tag
+    return tag_map
+
+
 # ── Public API ────────────────────────────────────────────────
 
-def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
+def run_vision_extractor(
+    media_urls: list[str],
+    internal_notes: list[InternalNote] | None = None,
+) -> VisionOutput:
     """
     Process all media_urls through Gemini Vision v3.
     Classifies each image and extracts structured data per type.
+
+    Sale-tag aware:
+      - If an image URL matches a note with sale_tag='montura', classify
+        directly as frame without calling Gemini.
+      - If sale_tag='estuche', classify as estuche reference.
+      - Otherwise, use the standard Gemini classification.
+
     Always returns a valid VisionOutput, even on complete failure.
     """
     if not media_urls:
         logger.info("Vision extractor: no media_urls provided, skipping")
         return VisionOutput()
+
+    # Build sale_tag lookup from internal notes
+    sale_tag_map = _build_sale_tag_map(internal_notes or [])
 
     prescriptions: list[PrescriptionFound] = []
     non_prescriptions: list[NonPrescriptionImage] = []
@@ -341,6 +374,35 @@ def run_vision_extractor(media_urls: list[str]) -> VisionOutput:
     for url in media_urls:
         logger.info("Processing image: %s", url)
 
+        # ── Check if this image has a sale_tag override ────────
+        sale_tag = sale_tag_map.get(url)
+
+        if sale_tag == "montura":
+            # Directly classify as frame — skip Gemini
+            logger.info("Sale-tag override: montura → classifying as frame")
+            frames.append(FrameData(
+                image_url=url,
+                description="Montura de referencia (venta directa)",
+                confidence=1.0,
+            ))
+            classifications.append(ImageClassification(
+                url=url, type="frame", confidence=1.0,
+            ))
+            continue
+
+        if sale_tag == "estuche":
+            # Classify as estuche reference — skip Gemini
+            logger.info("Sale-tag override: estuche → classifying as estuche reference")
+            non_prescriptions.append(NonPrescriptionImage(
+                image_url=url,
+                description="Referencia visual de estuche (venta directa)",
+            ))
+            classifications.append(ImageClassification(
+                url=url, type="estuche", confidence=1.0,
+            ))
+            continue
+
+        # ── Standard Gemini classification ─────────────────────
         image_bytes = _download_image(url)
         if not image_bytes:
             non_prescriptions.append(NonPrescriptionImage(

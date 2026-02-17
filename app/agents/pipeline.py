@@ -2,6 +2,10 @@
 Pipeline orchestrator — runs the 4-agent pipeline sequentially.
 Each agent is wrapped in try/except, so a failure in one agent
 does NOT stop the pipeline. Fallback outputs are used instead.
+
+Sale-tag aware:
+  - Passes internal_notes to vision extractor for tag-based classification
+  - Propagates suggested_order_type through the pipeline
 """
 
 from __future__ import annotations
@@ -33,7 +37,10 @@ def run_pipeline(job: AIOrderJob) -> FinalOrderResult:
     logger.info("=== AGENT 1: Vision Extractor ===")
     vision = VisionOutput()
     try:
-        vision = run_vision_extractor(payload.media_urls)
+        vision = run_vision_extractor(
+            media_urls=payload.media_urls,
+            internal_notes=payload.internal_notes,
+        )
         logger.info(
             "Vision: %d prescriptions, %d remissions, %d frames, %d classifications",
             len(vision.prescriptions_found),
@@ -57,10 +64,11 @@ def run_pipeline(job: AIOrderJob) -> FinalOrderResult:
             instructions=payload.instructions,
         )
         logger.info(
-            "Conversation: %d items, %d payment_mentions, urgency=%s",
+            "Conversation: %d items, %d payment_mentions, urgency=%s, order_type=%s",
             len(conversation.items_requested),
             len(conversation.payment_mentions),
             conversation.urgency,
+            conversation.suggested_order_type,
         )
     except Exception as exc:
         error_msg = f"Conversation analyzer fallo: {exc}"
@@ -124,8 +132,9 @@ def run_pipeline(job: AIOrderJob) -> FinalOrderResult:
 
     elapsed = time.time() - processing_start
     logger.info(
-        "Pipeline complete in %.1fs: completeness=%s, items=%d, warnings=%d",
-        elapsed, result.completeness, len(result.items), len(result.warnings),
+        "Pipeline complete in %.1fs: completeness=%s, items=%d, order_type=%s, warnings=%d",
+        elapsed, result.completeness, len(result.items),
+        result.order_type, len(result.warnings),
     )
 
     return result

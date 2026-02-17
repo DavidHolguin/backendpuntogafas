@@ -24,6 +24,9 @@ class MessagePayload(BaseModel):
 
 class InternalNote(BaseModel):
     content: Optional[str] = None
+    type: Optional[str] = "text"           # "text" | "image"
+    attachment_url: Optional[str] = None
+    sale_tag: Optional[str] = None          # "montura" | "estuche" | None
     created_at: Optional[str] = None
 
 

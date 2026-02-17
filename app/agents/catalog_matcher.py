@@ -2,6 +2,10 @@
 Agent 3: Catalog Matcher — cross-references extracted items with
 lens_catalog and products tables in Supabase.
 No LLM call needed; this is pure search + matching logic.
+
+Sale-tag aware:
+  - For venta_directa, only search products (skip lens catalog entirely)
+  - For estuche items, search products with category hints for accessories
 """
 
 from __future__ import annotations
@@ -162,22 +166,37 @@ def run_catalog_matcher(
 ) -> CatalogOutput:
     """
     Match extracted items against catalog and product databases.
+
+    For venta_directa orders:
+      - Only search products table (monturas/accesorios)
+      - Skip lens catalog entirely
+      - No lab_id suggestion
+
     Always returns a valid CatalogOutput, even if no matches found.
     """
+    is_venta_directa = conversation.suggested_order_type == "venta_directa"
+
     if not conversation.items_requested:
         logger.info("Catalog matcher: no items to match")
         return CatalogOutput(
             warnings=["No hay items para buscar en catálogo"],
         )
 
-    rx_values = _get_rx_values(vision)
+    rx_values = _get_rx_values(vision) if not is_venta_directa else {}
     matched: list[MatchedItem] = []
     warnings: list[str] = []
     suggested_lab_id: str | None = None
 
     for item in conversation.items_requested:
         try:
-            if item.type == "lente":
+            if is_venta_directa:
+                # ── Venta directa: only products, no lens catalog ──
+                match = _match_product(item)
+                logger.info(
+                    "Venta directa match: %s → %s ($%.0f)",
+                    item.type, match.description, match.unit_price,
+                )
+            elif item.type == "lente":
                 match = _match_lens(item, rx_values)
                 # Track suggested lab from the first matched lens
                 if match.lab_id and not suggested_lab_id:
@@ -225,12 +244,12 @@ def run_catalog_matcher(
             warnings.append(f"Error al buscar '{item.description}': {exc}")
 
     logger.info(
-        "Catalog matcher: %d items matched, %d warnings, lab=%s",
-        len(matched), len(warnings), suggested_lab_id,
+        "Catalog matcher: %d items matched, %d warnings, lab=%s, venta_directa=%s",
+        len(matched), len(warnings), suggested_lab_id, is_venta_directa,
     )
 
     return CatalogOutput(
         matched_items=matched,
         warnings=warnings,
-        suggested_lab_id=suggested_lab_id,
+        suggested_lab_id=suggested_lab_id if not is_venta_directa else None,
     )

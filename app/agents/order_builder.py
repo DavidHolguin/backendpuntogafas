@@ -4,6 +4,9 @@ previous agent outputs. Pure Python logic, no LLM calls.
 
 Merges payment data from remission (vision) + conversation into
 a single PaymentSuggestion. Priority: remission > conversation.
+
+Sale-tag aware:
+  - For venta_directa: skip prescription/lab, set order_type, simpler completeness
 """
 
 from __future__ import annotations
@@ -73,6 +76,125 @@ def _build_payment_suggestion(
     return None
 
 
+def _build_venta_directa(
+    job: AIOrderJob,
+    vision: VisionOutput,
+    conversation: ConversationOutput,
+    catalog: CatalogOutput,
+    agent_errors: dict[str, str] | None = None,
+    processing_start: float | None = None,
+) -> FinalOrderResult:
+    """
+    Build a venta_directa order — simpler flow without prescription/lab.
+    """
+    warnings: list[str] = []
+    items: list[OrderDraftItem] = []
+
+    # ── Build order items from catalog matches ────────────────
+    for mi in catalog.matched_items:
+        subtotal = (mi.unit_price or 0) * (mi.quantity or 1)
+        items.append(OrderDraftItem(
+            description=mi.description,
+            quantity=mi.quantity or 1,
+            unit_price=mi.unit_price or 0,
+            subtotal=subtotal,
+            product_id=mi.product_id,
+            needs_manual_selection=mi.needs_manual_selection,
+        ))
+
+    # ── Calculate totals ──────────────────────────────────────
+    total_amount = sum(item.subtotal for item in items)
+    balance_due = total_amount
+
+    # ── Payment suggestion ────────────────────────────────────
+    payment_suggestion = _build_payment_suggestion(vision, conversation)
+
+    # ── Frames (for reference) ────────────────────────────────
+    frames = vision.frames
+
+    # ── Consolidate warnings ──────────────────────────────────
+    warnings.extend(conversation.warnings)
+    warnings.extend(catalog.warnings)
+
+    if conversation.error:
+        warnings.append(f"Agente Conversación: {conversation.error}")
+    if catalog.error:
+        warnings.append(f"Agente Catálogo: {catalog.error}")
+
+    if not items:
+        warnings.append("No se identificaron productos — venta directa vacía requiere revisión manual")
+
+    if total_amount == 0 and items:
+        warnings.append("Total $0 — precios pendientes de asignar")
+
+    any_manual = any(i.needs_manual_selection for i in items)
+    if any_manual:
+        warnings.append("Uno o más items requieren selección manual")
+
+    # ── Completeness for venta_directa ────────────────────────
+    has_items = len(items) > 0
+    has_prices = total_amount > 0
+    no_manual = not any_manual
+
+    if has_items and has_prices and no_manual:
+        completeness = "completo"
+    elif has_items:
+        completeness = "parcial"
+    else:
+        completeness = "minimo"
+
+    needs_manual_review = completeness != "completo"
+
+    # ── Processing time ───────────────────────────────────────
+    processing_time_ms = 0
+    if processing_start:
+        processing_time_ms = int((time.time() - processing_start) * 1000)
+
+    # ── Determine suggested status ────────────────────────────
+    # Venta directa con pago completo → entregado
+    # Venta directa con pago parcial → pendiente_pago
+    suggested_status = "entregado"
+    payment_status = "pagado"
+
+    if payment_suggestion and payment_suggestion.type == "parcial":
+        suggested_status = "pendiente_pago"
+        payment_status = "parcial"
+
+    result = FinalOrderResult(
+        order_draft=OrderDraftHeader(
+            customer_id=job.customer_id,
+            sede_id=job.sede_id,
+            seller_id=job.requested_by,
+            status=suggested_status,
+            order_type="venta_directa",
+            total_amount=total_amount,
+            balance_due=balance_due if payment_status != "pagado" else 0,
+            payment_status=payment_status,
+        ),
+        order_type="venta_directa",
+        items=items,
+        frames=frames,
+        image_classifications=vision.image_classifications,
+        payment_suggestion=payment_suggestion,
+        customer_updates=conversation.customer_updates,
+        completeness=completeness,
+        suggested_status=suggested_status,
+        warnings=warnings,
+        needs_manual_review=needs_manual_review,
+        processing_time_ms=processing_time_ms,
+        agent_errors=agent_errors or {},
+    )
+
+    logger.info(
+        "Venta directa built: %d items, total=$%.0f, completeness=%s, "
+        "status=%s, payment=%s, warnings=%d",
+        len(items), total_amount, completeness,
+        suggested_status, payment_status, len(warnings),
+    )
+
+    return result
+
+
 def run_order_builder(
     job: AIOrderJob,
     vision: VisionOutput,
@@ -83,8 +205,18 @@ def run_order_builder(
 ) -> FinalOrderResult:
     """
     Assemble the final order draft from all agent outputs.
+    Routes to venta_directa builder when appropriate.
     ALWAYS returns a valid FinalOrderResult — never raises.
     """
+    # ── Route to venta_directa if detected ────────────────────
+    if conversation.suggested_order_type == "venta_directa":
+        logger.info("Building venta_directa order")
+        return _build_venta_directa(
+            job, vision, conversation, catalog,
+            agent_errors, processing_start,
+        )
+
+    # ── Standard optico flow ──────────────────────────────────
     warnings: list[str] = []
     items: list[OrderDraftItem] = []
 
@@ -217,12 +349,14 @@ def run_order_builder(
             sede_id=job.sede_id,
             seller_id=job.requested_by,
             status="borrador",
+            order_type="optico",
             total_amount=total_amount,
             balance_due=balance_due,
             payment_status="pendiente",
             lab_id=lab_id,
             promised_date=promised_date,
         ),
+        order_type="optico",
         items=items,
         prescription=prescription,
         remission=remission,
